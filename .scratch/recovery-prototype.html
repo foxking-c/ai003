@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>回测恢复流程 · 设计原型</title>
+<style>
+:root{font-family:system-ui,"Microsoft YaHei",sans-serif;color:#202b36;background:#f3f5f7;line-height:1.65}
+*{box-sizing:border-box}body{max-width:1120px;margin:32px auto;padding:0 24px}h1{font-size:28px;margin:0 0 8px}h2{font-size:19px;margin:0 0 12px}p{margin:8px 0}small,.muted{color:#5d6c7b}.tag{color:#24645b;font-weight:650;font-size:13px;letter-spacing:1px}
+section{background:white;border:1px solid #dce3e8;border-radius:12px;padding:22px;margin:18px 0}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.field{padding:12px;background:#f6f8f9;border-radius:7px}.field span{display:block;color:#5d6c7b;font-size:13px}.field strong{font-size:19px;overflow-wrap:anywhere}.wide{grid-column:1/-1}button{font:inherit;cursor:pointer;background:white;color:#24453f;border:1px solid #a6bcb7;border-radius:7px;padding:8px 12px;margin:4px 6px 4px 0}button:hover,button[aria-selected=true]{background:#e4f1ed;border-color:#24645b}button:focus-visible{outline:3px solid #58a591;outline-offset:2px}button:disabled{opacity:.45;cursor:default}.primary{background:#24645b;color:white}.primary:hover{background:#1e554d}#notice{border-left:4px solid #24645b;padding:12px 16px;background:#eef6f3;margin:14px 0;min-height:50px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}ol{padding-left:24px}li{margin:5px 0}@media(max-width:680px){.grid{grid-template-columns:1fr 1fr}body{padding:0 12px}.field strong{font-size:17px}}
+</style>
+<body>
+<header><div class="tag">设计探索 / 非正式系统</div><h1>决策已冻结，出错后怎样继续？</h1>
+<p>这个原型验证一件事：冻结同一天的决策后，能否恢复原请求，同时阻止改动作和重复记账。</p>
+<p class="muted">全部状态只在网页内存中。页面里的“中断”仅模拟丢弃计算进度，不验证 SQLite、进程崩溃或真实交易。成交结果采用预设数字。</p></header>
+<section><h2>当前账户与恢复状态</h2><div id="state" class="grid"></div><div id="notice" role="status" aria-live="polite"></div></section>
+<section><h2>自由尝试</h2><p class="muted">按钮始终可点；不符合当前状态的操作会说明原因。</p><div id="actions"></div></section>
+<section><h2>跟着场景走一遍</h2><div id="tabs" role="tablist" aria-label="恢复场景"></div><p id="scenario-description"></p><div id="steps"></div></section>
+<section><h2>操作记录</h2><ol id="history"></ol><details><summary>查看完整模型状态（便于核对设计）</summary><pre id="raw"></pre></details></section>
+<script id="recovery-model">
+// Pure, one-step state model. No browser or storage dependencies.
+const RecoveryModel = (() => {
+  const original = {request_id:"decision-001",step_id:0,action:{mode:"rebalance",targets:[{symbol:"SYN.A",weight:"0.10",lower:"-0.02",upper:"0.01"}]}};
+  const identity = "synthetic-code-data-reward-v1";
+  const initial = () => ({run_status:"ACTIVE",next_step_id:0,version:0,binding:null,receipt:null,
+    account:{cash:"100000.00",shares:0,equity:"100000.00"},last_error:null,recovery_action:"NONE",
+    volatile:{resumed:false,execution_read:false,candidate:null}});
+  const cleared = () => ({resumed:false,execution_read:false,candidate:null});
+  function transition(previous, event) {
+    const state = structuredClone(previous);
+    const answer = (message, response=null) => ({state,message,response});
+    if (event === "RESET_DEMO") return {state:initial(),message:"已开始一份新的演示。正式系统的 reset 会新建运行，不覆盖旧账本。",response:null};
+    if (event === "QUERY") return answer(state.binding && state.binding.status === "BOUND"
+      ? "已找回冻结的完整原请求，可点击‘提交原决策’恢复；查询不推进账户。" : "已读取最后提交的账户；查询不推进交易。",{account:state.account,binding:state.binding,next_step_id:state.next_step_id});
+    if (event.startsWith("SUBMIT")) {
+      const request = structuredClone(original);
+      if (event === "SUBMIT_NEW_ID") request.request_id="decision-002";
+      if (event === "SUBMIT_CHANGED_ACTION") request.action.targets[0].weight="0.20";
+      const environment = event === "SUBMIT_CHANGED_CODE" ? "changed-environment" : identity;
+      // A committed original response takes precedence over ended/stale/environment checks.
+      if (state.receipt && request.request_id === state.receipt.request.request_id) {
+        if (JSON.stringify(request) !== JSON.stringify(state.receipt.request)) return answer("拒绝：同一请求标识的内容不能变化。");
+        return answer("返回已保存的原响应；没有新增交易，结束状态和账户保持不变。",state.receipt.response);
+      }
+      if (state.binding && JSON.stringify(request) !== JSON.stringify(state.binding.request)) return answer("拒绝：这一天已绑定其他请求或内容。查询原请求后重试。");
+      if (state.run_status === "FINISHED" || state.run_status === "FAILED") return answer("拒绝：本运行已结束，不能继续交易。");
+      if (request.step_id !== state.next_step_id) return answer("拒绝：交易步号不匹配。");
+      if (environment !== identity) return answer("拒绝当前调用：计算环境已变化。旧运行仍保留；恢复原环境重试，或用新版本新建运行。");
+      if (!state.binding) state.binding={status:"BOUND",base_version:state.version,request,
+        plan:{symbol:"SYN.A",quantity:1000,reference_price:"10.00"},identity};
+      state.run_status="ACTIVE";state.last_error=null;state.recovery_action="RETRY_ORIGINAL";
+      state.volatile={resumed:true,execution_read:false,candidate:null};
+      return answer("原决策已冻结，可继续读取次日资料。账本和步号还没有推进。");
+    }
+    if (event === "CRASH") {state.volatile=cleared();return answer("计算进度已丢弃。冻结请求和已提交账本保留；再次提交原决策即可重算。");}
+    if (event === "LATE_FAILURE") {
+      if (!state.binding || state.binding.status !== "BOUND" || state.version !== state.binding.base_version || !["ACTIVE","PAUSED"].includes(state.run_status))
+        return answer("忽略迟到异常：原步骤已提交或已失效，不能把成功状态改回暂停。",state.receipt?.response ?? null);
+      state.run_status="PAUSED";state.last_error="演示中的暂时计算故障";state.recovery_action="RETRY_ORIGINAL";state.volatile=cleared();
+      return answer("暂时暂停；账户没有推进，冻结决策仍可重试。");
+    }
+    if (!state.binding || state.binding.status !== "BOUND" || !state.volatile.resumed || state.run_status !== "ACTIVE")
+      return answer("请先提交原决策，建立或恢复本次计算。");
+    if (event === "READ_EXECUTION") {state.volatile.execution_read=true;return answer("已读取次日资料。此时仍不能改动作，账户没有推进。");}
+    if (event === "CALCULATE") {
+      if (!state.volatile.execution_read) return answer("请先读取次日资料。");
+      state.volatile.candidate={account:{cash:"89990.00",shares:1000,equity:"100490.00"},reward:"0.0049",terminated:false,truncated:true};
+      return answer("预设候选结果已生成，还未记入账户。它用于演示提交行为，不是撮合计算。");
+    }
+    if (event === "REWARD_FAIL") {
+      if (!state.volatile.candidate) return answer("请先生成候选结果，再模拟奖励故障。");
+      state.run_status="PAUSED";state.last_error="同一奖励实现的暂时故障";state.recovery_action="RETRY_ORIGINAL";state.volatile=cleared();
+      return answer("奖励失败：候选结果丢弃，账本和步号未变；恢复后重试原请求。");
+    }
+    if (event === "COMMIT" || event === "COMMIT_LOST_RESPONSE") {
+      if (!state.volatile.candidate) return answer("请先生成候选结果。");
+      if (state.version !== state.binding.base_version) return answer("拒绝过期候选：账户版本已变化。");
+      const response=structuredClone(state.volatile.candidate);
+      state.account=response.account;state.version+=1;state.next_step_id+=1;state.binding.status="COMMITTED";
+      state.receipt={request:structuredClone(state.binding.request),response};state.run_status="FINISHED";
+      state.last_error=null;state.recovery_action="NONE";state.volatile=cleared();
+      return answer(event === "COMMIT" ? "账户和响应一起提交，窗口结束。再次提交原请求只返回旧响应。" : "提交已成功，但调用方没收到响应。原请求重试即可取回，不能再记一次账。",event === "COMMIT" ? response : null);
+    }
+    return answer("未识别的演示操作。");
+  }
+  return {initial,transition};
+})();
+</script>
+<script>
+const labels={RESET_DEMO:"重新演示",SUBMIT_ORIGINAL:"提交原决策",READ_EXECUTION:"读取次日资料",CALCULATE:"生成候选结果",REWARD_FAIL:"模拟奖励失败",COMMIT:"成功提交",COMMIT_LOST_RESPONSE:"提交成功但响应丢失",CRASH:"模拟中断",QUERY:"查询原请求",SUBMIT_NEW_ID:"换请求标识再提交",SUBMIT_CHANGED_ACTION:"改动作再提交",SUBMIT_CHANGED_CODE:"换计算版本重试",LATE_FAILURE:"收到迟到异常"};
+const scenarios=[
+  {name:"正常完成",description:"先冻结决策，再计算并提交；查看资金与步号只在最后变化。",events:["SUBMIT_ORIGINAL","READ_EXECUTION","CALCULATE","COMMIT"]},
+  {name:"读资料前中断",description:"绑定后即使尚未读到次日资料，也不能换动作。",events:["SUBMIT_ORIGINAL","CRASH","SUBMIT_NEW_ID","QUERY","SUBMIT_ORIGINAL","READ_EXECUTION","CALCULATE","COMMIT"]},
+  {name:"请求标识丢失",description:"已经看过次日资料时中断；通过查询找回原请求，不能换新标识或动作。",events:["SUBMIT_ORIGINAL","READ_EXECUTION","CRASH","SUBMIT_NEW_ID","SUBMIT_CHANGED_ACTION","QUERY","SUBMIT_ORIGINAL","READ_EXECUTION","CALCULATE","COMMIT"]},
+  {name:"奖励暂时失败",description:"暂停时账户不动；同一代码的暂时故障恢复后，沿原请求重算。",events:["SUBMIT_ORIGINAL","READ_EXECUTION","CALCULATE","REWARD_FAIL","QUERY","SUBMIT_ORIGINAL","READ_EXECUTION","CALCULATE","COMMIT"]},
+  {name:"成功响应丢失",description:"运行已经结束，重试原请求仍能读到已保存结果；换动作依旧被拒绝。",events:["SUBMIT_ORIGINAL","READ_EXECUTION","CALCULATE","COMMIT_LOST_RESPONSE","SUBMIT_ORIGINAL","SUBMIT_CHANGED_ACTION"]},
+  {name:"恢复时版本变化",description:"尚未提交时拒绝换版本计算；已提交的原响应则可直接读取，无需重新计算。",events:["SUBMIT_ORIGINAL","READ_EXECUTION","CRASH","SUBMIT_CHANGED_CODE","SUBMIT_ORIGINAL","READ_EXECUTION","CALCULATE","COMMIT","SUBMIT_CHANGED_CODE"]},
+  {name:"迟到故障",description:"另一份计算在成功提交后报错；它不能把账户改回暂停。",events:["SUBMIT_ORIGINAL","READ_EXECUTION","CALCULATE","COMMIT","LATE_FAILURE","SUBMIT_ORIGINAL"]}
+];
+let model=RecoveryModel.initial(), log=[], selected=0, progress=0, message="尚未提交决策。请选择场景，或自由点击按钮。";
+function element(tag,text){const item=document.createElement(tag);item.textContent=text;return item;}
+function button(label,action){const b=element("button",label);b.type="button";b.onclick=action;return b;}
+function dispatch(event){const result=RecoveryModel.transition(model,event);model=result.state;message=result.message;log.push(`${labels[event]}：${message}`);render();}
+function render(){
+  const names={ACTIVE:"可运行",PAUSED:"暂停",FINISHED:"窗口结束",FAILED:"失败"};
+  const fields=[["运行状态",names[model.run_status]],["已提交交易步数",model.next_step_id],["账户版本",model.version],["可用现金（元）",model.account.cash],["持有股数",model.account.shares],["总资产（元）",model.account.equity],["决策绑定",model.binding ? (model.binding.status === "BOUND" ? "已冻结，尚未提交" : "已提交") : "未绑定"],["冻结请求标识",model.binding?.request.request_id ?? "无"],["当前内存进度",model.volatile.candidate ? "候选已生成" : model.volatile.execution_read ? "已读次日资料" : model.volatile.resumed ? "等待读取资料" : "无计算进度"],["下一步恢复方式",model.recovery_action === "RETRY_ORIGINAL" ? "重试原请求" : "无需恢复"],["最近保存的错误",model.last_error ?? "无"]];
+  const state=document.getElementById("state");state.replaceChildren();for(const [name,value] of fields){const f=element("div","");f.className="field";f.append(element("span",name),element("strong",String(value)));state.append(f);}
+  document.getElementById("notice").textContent=message;
+  document.getElementById("raw").textContent=JSON.stringify(model,null,2);
+  const history=document.getElementById("history");history.replaceChildren(...log.map(line=>element("li",line)));
+  const tabs=document.getElementById("tabs");tabs.replaceChildren(...scenarios.map((s,i)=>{const b=button(s.name,()=>start(i));b.setAttribute("role","tab");b.setAttribute("aria-selected",String(i===selected));return b;}));
+  document.getElementById("scenario-description").textContent=scenarios[selected].description;
+  const steps=document.getElementById("steps");steps.replaceChildren(...scenarios[selected].events.map((event,i)=>{const b=button(`${i+1}. ${labels[event]}`,()=>{progress+=1;dispatch(event);});b.disabled=i!==progress;if(i===progress)b.className="primary";return b;}));
+}
+function start(index){selected=index;progress=0;model=RecoveryModel.initial();log=[];message="已重置演示；依次点击当前场景的步骤。";render();}
+for(const [event,label] of Object.entries(labels))document.getElementById("actions").append(button(label,()=>{if(event==="RESET_DEMO"){start(selected);return;}dispatch(event);}));
+render();
+</script>
+</body>
+</html>
