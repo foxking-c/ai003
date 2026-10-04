@@ -3,7 +3,7 @@
 Status: READY
 Blocked by: 无
 
-依据：[开发计划第 6 节](../../../4.DEVELOPMENT_PLAN.md#6-执行第一份开发任务已明确)、[spec](../../../1.spec.md)、[架构](../../../2.ARCHITECTURE.md)、[execution-v1](../../../3.EXECUTION_POLICY_V1.md)。
+依据：[开发计划第 6 节](../../../5.DEVELOPMENT_PLAN.md#6-执行第一份开发任务已明确)、[spec](../../../1.spec.md)、[架构](../../../2.ARCHITECTURE.md)、[execution-v1](../../../3.EXECUTION_POLICY_V1.md)。
 
 ## 交付
 
@@ -30,3 +30,12 @@ Blocked by: 无
 ## 完成证据
 
 待填写：环境版本与锁、运行命令、fixture 身份、A 类输出、已通过检查及限制。当前尚无实现。
+
+## contracts-v1 补充验收
+
+依据：[架构补充契约](../../../4.CONTRACTS.md)。以下追加到原验收，状态与依赖不变；当前均未执行。
+
+- [ ] K03/K08：采用明确记录的 contracts-v1 / target-exposure-v1；有限合成包走 frozen-inputs-v1，包含已知无事件覆盖；原A14金额不变。
+- [ ] K04/K05：只改合格收盘资料不改变开盘成交；晚到价格不能经账户派生值或reward泄漏，不能产生伪样本。
+- [ ] K07/K12：至少验证首次读取同字节哈希、源目录替换不影响已绑定快照，以及账户/事实/响应同源对账；重启与复杂故障留T07。
+- [ ] K15：记录首日分阶段耗时与存储大小，不声明性能达标；run-store-v1建立两次短事务及已版本化响应基础。
